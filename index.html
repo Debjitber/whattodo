@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Endless Multiplayer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Firebase (Modular SDK) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, serverTimestamp, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- FIREBASE SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        
+        let localPlayerId = null;
+        let lastUpdateTime = 0;
+        const UPDATE_INTERVAL = 50; // ms (Update server 20 times a second max)
+
+        // Game State exposed to window for the main script
+        window.gameState = {
+            otherPlayers: {}, // Map of ID -> { mesh, targetPos, targetRot }
+            playerCount: 0
+        };
+
+        // --- AUTH & MULTIPLAYER LOGIC ---
+        const initAuth = async () => {
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+            if (initialAuthToken) {
+                await signInWithCustomToken(auth, initialAuthToken);
+            } else {
+                await signInAnonymously(auth);
+            }
+        };
+
+        initAuth();
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                localPlayerId = user.uid;
+                console.log("Logged in as:", localPlayerId);
+                
+                // Start listening to other players
+                const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+                
+                // Cleanup old player data on disconnect (handled roughly by presence logic or TTL in a real app)
+                // For this demo, we just update.
+                
+                onSnapshot(playersRef, (snapshot) => {
+                    const currentIds = [];
+                    snapshot.forEach((doc) => {
+                        const data = doc.data();
+                        const pid = doc.id;
+                        currentIds.push(pid);
+
+                        if (pid === localPlayerId) return; // Ignore self
+
+                        // Update or Create remote player
+                        if (!window.gameState.otherPlayers[pid]) {
+                            window.createRemotePlayer(pid, data);
+                        } else {
+                            // Update target for interpolation
+                            const op = window.gameState.otherPlayers[pid];
+                            op.targetPos.set(data.x, data.y, data.z);
+                            op.targetRot = data.ry;
+                            op.color = data.color;
+                        }
+                    });
+
+                    // Remove disconnected players
+                    Object.keys(window.gameState.otherPlayers).forEach(pid => {
+                        if (!currentIds.includes(pid)) {
+                            window.removeRemotePlayer(pid);
+                        }
+                    });
+
+                    // Update UI Count
+                    window.gameState.playerCount = currentIds.length;
+                    document.getElementById('player-count').innerText = `Players: ${currentIds.length}`;
+                });
+            }
+        });
+
+        // Function to send updates to Firebase
+        window.sendPlayerUpdate = (x, y, z, ry, color) => {
+            if (!localPlayerId) return;
+            const now = Date.now();
+            if (now - lastUpdateTime < UPDATE_INTERVAL) return;
+
+            const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', localPlayerId);
+            setDoc(playerRef, {
+                x: x, y: y, z: z, ry: ry, 
+                color: color,
+                timestamp: serverTimestamp()
+            }).catch(e => console.error(e));
+            
+            lastUpdateTime = now;
+        };
+
+        // Cleanup on close
+        window.addEventListener('beforeunload', () => {
+            if (localPlayerId) {
+                 const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', localPlayerId);
+                 deleteDoc(playerRef);
+            }
+        });
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+        body { margin: 0; overflow: hidden; background-color: #1a1a2e; font-family: 'Inter', sans-serif; user-select: none; }
+        #game-container { position: relative; width: 100vw; height: 100vh; }
+        
+        /* UI OVERLAY */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between;
+        }
+        
+        #top-bar {
+            padding: 20px; display: flex; justify-content: space-between; align-items: flex-start;
+            pointer-events: auto;
+        }
+
+        #player-count {
+            background: rgba(0,0,0,0.6); color: #4cc9f0; padding: 8px 16px; border-radius: 20px;
+            font-weight: bold; font-size: 16px; box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        #camera-btn {
+            width: 50px; height: 50px; background: rgba(0,0,0,0.6); border-radius: 50%;
+            display: flex; justify-content: center; align-items: center; font-size: 24px;
+            cursor: pointer; border: 2px solid rgba(255,255,255,0.2); transition: all 0.2s;
+        }
+        #camera-btn:active { transform: scale(0.9); background: rgba(255,255,255,0.2); }
+
+        #controls {
+            padding: 20px; display: flex; justify-content: space-between; align-items: flex-end;
+            pointer-events: auto;
+        }
+
+        /* DPAD */
+        #dpad {
+            display: grid; grid-template-columns: 60px 60px 60px; grid-template-rows: 60px 60px;
+            gap: 5px;
+        }
+        .dbtn {
+            width: 60px; height: 60px; background: rgba(255,255,255,0.15); border-radius: 12px;
+            backdrop-filter: blur(4px); border: 1px solid rgba(255,255,255,0.1);
+            display: flex; justify-content: center; align-items: center; font-size: 24px; color: white;
+            touch-action: manipulation; cursor: pointer;
+        }
+        .dbtn:active, .dbtn.active { background: rgba(76, 201, 240, 0.6); transform: scale(0.95); }
+
+        /* JUMP */
+        #jump-btn {
+            width: 80px; height: 80px; background: linear-gradient(135deg, #f72585, #b5179e);
+            border-radius: 50%; border: 4px solid rgba(255,255,255,0.2);
+            color: white; font-weight: bold; display: flex; justify-content: center; align-items: center;
+            box-shadow: 0 4px 15px rgba(247, 37, 133, 0.4); touch-action: manipulation; cursor: pointer;
+        }
+        #jump-btn:active, #jump-btn.active { transform: scale(0.9); }
+
+        /* Time Display */
+        #time-display {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            color: white; font-weight: bold; text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <div id="ui-layer">
+            <div id="top-bar">
+                <div id="camera-btn">🌚</div>
+                <div id="player-count">Players: 1</div>
+            </div>
+            <div id="time-display">12:00</div>
+            <div id="controls">
+                <div id="dpad">
+                    <div style="grid-column: 2;">
+                        <div class="dbtn" id="btn-up">▲</div>
+                    </div>
+                    <div style="grid-row: 2; display:flex; gap: 5px;">
+                        <div class="dbtn" id="btn-left">◀</div>
+                        <div class="dbtn" id="btn-down">▼</div>
+                        <div class="dbtn" id="btn-right">▶</div>
+                    </div>
+                </div>
+                <div id="jump-btn">JUMP</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- GAME ENGINE & LOGIC ---
+
+        // 1. Noise Generator (Simplex-like for Terrain)
+        // A simple deterministic noise function to ensure all clients see same terrain at same coords
+        function pseudoNoise(x, z) {
+            let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+            return n - Math.floor(n);
+        }
+        
+        function smoothNoise(x, z) {
+            const intX = Math.floor(x);
+            const intZ = Math.floor(z);
+            const fracX = x - intX;
+            const fracZ = z - intZ;
+            
+            const v1 = pseudoNoise(intX, intZ);
+            const v2 = pseudoNoise(intX + 1, intZ);
+            const v3 = pseudoNoise(intX, intZ + 1);
+            const v4 = pseudoNoise(intX + 1, intZ + 1);
+
+            const i1 = v1 * (1 - fracX) + v2 * fracX;
+            const i2 = v3 * (1 - fracX) + v4 * fracX;
+            
+            return i1 * (1 - fracZ) + i2 * fracZ;
+        }
+
+        // Layered noise for terrain height
+        function getTerrainHeight(x, z) {
+            let y = 0;
+            y += smoothNoise(x * 0.02, z * 0.02) * 15;
+            y += smoothNoise(x * 0.1, z * 0.1) * 2;
+            // Create valleys
+            if (y < 3) y = y * 0.5 - 2; 
+            return y;
+        }
+
+        // --- THREE.JS SETUP ---
+        let scene, camera, renderer;
+        let player;
+        const clock = new THREE.Clock();
+        const chunks = {}; // Store chunk meshes
+        const chunkSize = 32; // Size of one chunk (16x16 grid scale factor)
+        const renderDistance = 3; // How many chunks away to draw
+        
+        // Player & Camera
+        const playerSettings = { speed: 10, rotSpeed: 2.5, jump: 12, gravity: 25, height: 2, radius: 0.5 };
+        const velocity = new THREE.Vector3();
+        let isJumping = false;
+        let onGround = false;
+        let camMode = 0; // 0 = Third, 1 = First
+
+        // Inputs
+        const keys = { w: false, a: false, s: false, d: false, space: false };
+        const joystick = { x: 0, y: 0 };
+        
+        // Multiplayer
+        const remotePlayers = {}; // Map stored in window.gameState.otherPlayers
+        
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.Fog(0x87ceeb, 20, 120);
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x87ceeb);
+            renderer.shadowMap.enabled = true;
+            document.getElementById('game-container').appendChild(renderer.domElement);
+
+            // Lights
+            const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(50, 100, 50);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 50;
+            dirLight.shadow.camera.bottom = -50;
+            dirLight.shadow.camera.left = -50;
+            dirLight.shadow.camera.right = 50;
+            dirLight.shadow.mapSize.set(1024, 1024);
+            scene.add(dirLight);
+            window.sunLight = dirLight; // Store for day/night cycle
+
+            // Player
+            createPlayer();
+
+            // Event Listeners
+            window.addEventListener('resize', onResize);
+            setupInputs();
+            
+            // Loop
+            animate();
+        }
+
+        function createPlayer() {
+            const geo = new THREE.CylinderGeometry(0.5, 0.5, 2, 16);
+            const mat = new THREE.MeshLambertMaterial({ color: Math.random() * 0xffffff });
+            player = new THREE.Mesh(geo, mat);
+            player.position.y = 10; // Start high
+            player.castShadow = true;
+            player.receiveShadow = true;
+            
+            // Player eyes (to see rotation)
+            const eyeGeo = new THREE.BoxGeometry(0.6, 0.2, 0.5);
+            const eyeMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
+            const eyes = new THREE.Mesh(eyeGeo, eyeMat);
+            eyes.position.set(0, 0.5, -0.3);
+            player.add(eyes);
+            
+            scene.add(player);
+            
+            // Store color for networking
+            player.userData.color = mat.color.getHex();
+        }
+
+        // --- CHUNK SYSTEM ---
+        function updateChunks() {
+            // Determine which chunk player is in
+            const pZx = Math.floor(player.position.x / chunkSize);
+            const pZz = Math.floor(player.position.z / chunkSize);
+            
+            const activeKeys = new Set();
+
+            for (let x = -renderDistance; x <= renderDistance; x++) {
+                for (let z = -renderDistance; z <= renderDistance; z++) {
+                    const key = `${pZx + x},${pZz + z}`;
+                    activeKeys.add(key);
+
+                    if (!chunks[key]) {
+                        createChunk(pZx + x, pZz + z);
+                    }
+                }
+            }
+
+            // Remove old chunks
+            for (const key in chunks) {
+                if (!activeKeys.has(key)) {
+                    scene.remove(chunks[key]);
+                    chunks[key].geometry.dispose();
+                    chunks[key].material.dispose();
+                    delete chunks[key];
+                }
+            }
+        }
+
+        function createChunk(cx, cz) {
+            // Create a plane for this chunk
+            const geo = new THREE.PlaneGeometry(chunkSize, chunkSize, 16, 16);
+            
+            const pos = geo.attributes.position;
+            for (let i = 0; i < pos.count; i++) {
+                const wx = pos.getX(i) + cx * chunkSize; // World X
+                const wz = -(pos.getY(i) + cz * chunkSize); // World Z (Plane is rotated -90 X, so Y is Z)
+                
+                // Get Height
+                const h = getTerrainHeight(wx, wz);
+                pos.setZ(i, h); // Set Z because plane starts vertical then rotates
+            }
+            geo.computeVertexNormals();
+
+            const mat = new THREE.MeshLambertMaterial({ color: 0x5fa052 }); // Grass Green
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.rotation.x = -Math.PI / 2;
+            mesh.position.set(cx * chunkSize, 0, cz * chunkSize);
+            mesh.receiveShadow = true;
+            
+            scene.add(mesh);
+            chunks[`${cx},${cz}`] = mesh;
+            
+            // Populate Chunk with Trees/Rocks
+            populateChunk(mesh, cx, cz);
+        }
+
+        function populateChunk(chunkMesh, cx, cz) {
+            // Simple deterministic RNG based on chunk coord
+            let seed = (cx * 15485863) + (cz * 2038074743); 
+            const random = () => {
+                seed = (seed * 1664525 + 1013904223) % 4294967296;
+                return seed / 4294967296;
+            };
+
+            const count = Math.floor(random() * 5) + 1; // 1 to 5 objects per chunk
+            
+            for(let i=0; i<count; i++) {
+                const rx = (random() - 0.5) * chunkSize;
+                const rz = (random() - 0.5) * chunkSize;
+                const wx = cx * chunkSize + rx;
+                const wz = cz * chunkSize + rz;
+                
+                const h = getTerrainHeight(wx, wz);
+                
+                if (h < -1) continue; // Don't place underwater/deep valleys
+                
+                const type = random();
+                let obj;
+                
+                if (type > 0.3) {
+                    // Tree (Cone + Cylinder)
+                    const group = new THREE.Group();
+                    const trunk = new THREE.Mesh(
+                        new THREE.CylinderGeometry(0.2, 0.3, 1.5, 6),
+                        new THREE.MeshLambertMaterial({color: 0x8B4513})
+                    );
+                    trunk.position.y = 0.75;
+                    
+                    const leaves = new THREE.Mesh(
+                        new THREE.ConeGeometry(1.5, 3, 8),
+                        new THREE.MeshLambertMaterial({color: 0x228B22})
+                    );
+                    leaves.position.y = 2.5;
+                    
+                    group.add(trunk, leaves);
+                    group.position.set(rx, h, -rz); // Local to chunk, but chunk is rotated. 
+                    // Actually easiest to just add to scene at world pos
+                    // But to manage memory, better to add to chunk mesh children.
+                    // Note: Chunk mesh is rotated -90 X. 
+                    // Local Y is World Up. Local Z is World Forward (approx).
+                    // Position set: x=rx, y=-rz (plane Y), z=h
+                    // Let's attach to scene for simplicity of coordinates
+                    obj = group;
+                    obj.position.set(wx, h, wz);
+                } else {
+                    // Rock
+                    obj = new THREE.Mesh(
+                        new THREE.DodecahedronGeometry(Math.random() * 0.8 + 0.5),
+                        new THREE.MeshLambertMaterial({color: 0x888888})
+                    );
+                    obj.position.set(wx, h + 0.5, wz);
+                }
+                
+                obj.castShadow = true;
+                obj.receiveShadow = true;
+                
+                // Hack: Attach to chunk so it gets deleted with chunk
+                // We need to inverse the chunk transform
+                chunkMesh.attach(obj); 
+            }
+        }
+
+        // --- MULTIPLAYER HANDLERS (Called by Firebase Logic) ---
+        window.createRemotePlayer = (id, data) => {
+            const geo = new THREE.CylinderGeometry(0.5, 0.5, 2, 16);
+            const mat = new THREE.MeshLambertMaterial({ color: data.color || 0xff0000 });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Add Eyes
+            const eyeGeo = new THREE.BoxGeometry(0.6, 0.2, 0.5);
+            const eyes = new THREE.Mesh(eyeGeo, new THREE.MeshLambertMaterial({color: 0x000000}));
+            eyes.position.set(0, 0.5, -0.3);
+            mesh.add(eyes);
+
+            // Add Big Arrow Above Head
+            const arrowGeo = new THREE.ConeGeometry(0.4, 1, 8);
+            const arrowMat = new THREE.MeshBasicMaterial({ color: 0xffff00 }); // Yellow
+            const arrow = new THREE.Mesh(arrowGeo, arrowMat);
+            arrow.position.set(0, 2.5, 0);
+            arrow.rotation.x = Math.PI; // Point down
+            
+            // Float animation setup
+            arrow.userData = { offset: Math.random() * 10 };
+            
+            mesh.add(arrow);
+            mesh.userData.arrow = arrow;
+            
+            scene.add(mesh);
+            
+            window.gameState.otherPlayers[id] = {
+                mesh: mesh,
+                targetPos: new THREE.Vector3(data.x, data.y, data.z),
+                targetRot: data.ry,
+                color: data.color
+            };
+        };
+
+        window.removeRemotePlayer = (id) => {
+            if (window.gameState.otherPlayers[id]) {
+                scene.remove(window.gameState.otherPlayers[id].mesh);
+                delete window.gameState.otherPlayers[id];
+            }
+        };
+
+        // --- MAIN LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = Math.min(clock.getDelta(), 0.1);
+            const time = Date.now() * 0.001;
+
+            updatePlayerPhysics(delta);
+            updateChunks();
+            updateDayNight(delta);
+            updateRemotePlayers(delta, time);
+            
+            // Network Update (Send pos)
+            if (window.sendPlayerUpdate && player) {
+                window.sendPlayerUpdate(
+                    player.position.x, 
+                    player.position.y, 
+                    player.position.z, 
+                    player.rotation.y, 
+                    player.userData.color
+                );
+            }
+
+            // Camera Follow
+            updateCamera();
+
+            renderer.render(scene, camera);
+        }
+
+        function updatePlayerPhysics(dt) {
+            // Input
+            const speed = playerSettings.speed;
+            const rotSpeed = playerSettings.rotSpeed;
+            
+            if (keys.a || document.getElementById('btn-left').classList.contains('active')) {
+                player.rotation.y += rotSpeed * dt;
+            }
+            if (keys.d || document.getElementById('btn-right').classList.contains('active')) {
+                player.rotation.y -= rotSpeed * dt;
+            }
+            
+            const forward = (keys.w || document.getElementById('btn-up').classList.contains('active')) ? 1 : 
+                            (keys.s || document.getElementById('btn-down').classList.contains('active')) ? -0.5 : 0;
+            
+            // Calculate Movement
+            const dx = Math.sin(player.rotation.y) * forward * speed * dt;
+            const dz = Math.cos(player.rotation.y) * forward * speed * dt;
+            
+            velocity.x = dx;
+            velocity.z = dz;
+            
+            // Gravity
+            velocity.y -= playerSettings.gravity * dt;
+            
+            // Apply Move
+            player.position.x -= velocity.x; // ThreeJS forward is -Z usually, adjusting logic
+            player.position.z -= velocity.z;
+            player.position.y += velocity.y * dt;
+            
+            // Ground Collision
+            const groundH = getTerrainHeight(player.position.x, player.position.z);
+            const playerBottom = player.position.y - playerSettings.height/2;
+            
+            if (playerBottom < groundH) {
+                player.position.y = groundH + playerSettings.height/2;
+                velocity.y = 0;
+                onGround = true;
+                isJumping = false;
+            } else {
+                onGround = false;
+            }
+            
+            // Snap to ground if close (prevents flying off slopes)
+            if (!isJumping && playerBottom < groundH + 0.5) {
+                 player.position.y = THREE.MathUtils.lerp(player.position.y, groundH + playerSettings.height/2, 10 * dt);
+            }
+            
+            // World Bounds (None! It's endless)
+        }
+
+        function updateRemotePlayers(dt, time) {
+            for (const id in window.gameState.otherPlayers) {
+                const p = window.gameState.otherPlayers[id];
+                // Interpolate Position
+                p.mesh.position.lerp(p.targetPos, 10 * dt);
+                
+                // Interpolate Rotation (simple linear for now)
+                let rotDiff = p.targetRot - p.mesh.rotation.y;
+                // Normalize angle
+                while (rotDiff > Math.PI) rotDiff -= Math.PI * 2;
+                while (rotDiff < -Math.PI) rotDiff += Math.PI * 2;
+                p.mesh.rotation.y += rotDiff * 5 * dt;
+
+                // Animate Arrow
+                if (p.mesh.userData.arrow) {
+                    p.mesh.userData.arrow.position.y = 2.5 + Math.sin(time * 3 + p.mesh.userData.arrow.userData.offset) * 0.2;
+                    p.mesh.userData.arrow.rotation.y += dt;
+                }
+            }
+        }
+
+        function updateCamera() {
+            if (!player) return;
+            
+            if (camMode === 0) { // Third Person
+                const relativeOffset = new THREE.Vector3(0, 3, 6);
+                const cameraOffset = relativeOffset.applyMatrix4(player.matrixWorld);
+                camera.position.lerp(cameraOffset, 0.1);
+                camera.lookAt(player.position.x, player.position.y + 1, player.position.z);
+            } else { // First Person (Eye)
+                const eyePos = new THREE.Vector3(0, 0.8, -0.4).applyMatrix4(player.matrixWorld);
+                camera.position.copy(eyePos);
+                
+                const lookTarget = new THREE.Vector3(0, 0.8, -5).applyMatrix4(player.matrixWorld);
+                camera.lookAt(lookTarget);
+            }
+        }
+
+        function updateDayNight(dt) {
+            const time = Date.now() * 0.0005; // Day speed
+            const sunY = Math.sin(time) * 100;
+            const sunX = Math.cos(time) * 100;
+            
+            if (window.sunLight) {
+                window.sunLight.position.set(sunX, sunY, 50);
+                window.sunLight.intensity = Math.max(0.2, Math.sin(time) * 1.5);
+            }
+            
+            // Sky Color
+            const dayColor = new THREE.Color(0x87ceeb);
+            const nightColor = new THREE.Color(0x1a1a2e);
+            const mix = (Math.sin(time) + 1) / 2;
+            const curColor = nightColor.clone().lerp(dayColor, mix);
+            renderer.setClearColor(curColor);
+            scene.fog.color.copy(curColor);
+            
+            // Update UI Time
+            const hours = Math.floor(((time / (Math.PI * 2)) * 24) % 24 + 12) % 24;
+            const mins = Math.floor((time % 1) * 60);
+            document.getElementById('time-display').innerText = `${hours.toString().padStart(2,'0')}:${mins.toString().padStart(2,'0')}`;
+        }
+
+        function setupInputs() {
+            document.addEventListener('keydown', (e) => {
+                const k = e.key.toLowerCase();
+                if (k === 'w' || k === 'arrowup') keys.w = true;
+                if (k === 'a' || k === 'arrowleft') keys.a = true;
+                if (k === 's' || k === 'arrowdown') keys.s = true;
+                if (k === 'd' || k === 'arrowright') keys.d = true;
+                if (k === ' ' && onGround) { velocity.y = playerSettings.jump; isJumping = true; onGround = false; }
+            });
+            
+            document.addEventListener('keyup', (e) => {
+                const k = e.key.toLowerCase();
+                if (k === 'w' || k === 'arrowup') keys.w = false;
+                if (k === 'a' || k === 'arrowleft') keys.a = false;
+                if (k === 's' || k === 'arrowdown') keys.s = false;
+                if (k === 'd' || k === 'arrowright') keys.d = false;
+            });
+
+            // Touch UI
+            const btns = document.querySelectorAll('.dbtn');
+            btns.forEach(btn => {
+                btn.addEventListener('touchstart', (e) => { e.preventDefault(); btn.classList.add('active'); });
+                btn.addEventListener('touchend', (e) => { e.preventDefault(); btn.classList.remove('active'); });
+                btn.addEventListener('mousedown', () => btn.classList.add('active'));
+                btn.addEventListener('mouseup', () => btn.classList.remove('active'));
+            });
+            
+            const jumpBtn = document.getElementById('jump-btn');
+            jumpBtn.addEventListener('touchstart', (e) => { 
+                e.preventDefault(); 
+                jumpBtn.classList.add('active'); 
+                if(onGround) { velocity.y = playerSettings.jump; isJumping = true; onGround = false; }
+            });
+             jumpBtn.addEventListener('touchend', (e) => { 
+                e.preventDefault(); 
+                jumpBtn.classList.remove('active'); 
+            });
+            jumpBtn.addEventListener('mousedown', () => {
+                jumpBtn.classList.add('active');
+                if(onGround) { velocity.y = playerSettings.jump; isJumping = true; onGround = false; }
+            });
+            jumpBtn.addEventListener('mouseup', () => jumpBtn.classList.remove('active'));
+
+            document.getElementById('camera-btn').addEventListener('click', () => {
+                camMode = camMode === 0 ? 1 : 0;
+            });
+        }
+        
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
